@@ -19,6 +19,13 @@ pub(super) const UP: usize = 0;
 pub(super) const FETCHED: usize = 1;
 
 static MOVED: Mutex<Option<HashMap<(u64, u64), Moved>>> = Mutex::new(None);
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+static FETCH_COMMANDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(super) fn fetched_commands(pieces: usize, commands: usize) {
+    FETCH_COMMANDS[0].fetch_add(pieces as u64, Relaxed);
+    FETCH_COMMANDS[1].fetch_add(commands as u64, Relaxed);
+}
 
 /// Offsets `ranges` of the copy of `span` (title address, bytes) went `way`.
 pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (usize, usize)>) {
@@ -38,6 +45,8 @@ pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (
 
 /// For the log, over `frames` frames.
 pub(super) fn line(frames: f64) {
+    let [pieces, commands] = FETCH_COMMANDS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0));
+    tracing::info!("readback per frame: {pieces:.0} pieces in {commands:.0} copy commands");
     let all = MOVED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut all: Vec<_> = all.into_iter().collect();
     all.sort_by_key(|(_, m)| std::cmp::Reverse(m.bytes[0] + m.bytes[1]));

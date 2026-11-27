@@ -13,6 +13,8 @@
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
+//! `VICTORY_RX_TEX_READ=1` reuses CPU tiling plans and pixel storage on the
+//! thread landing the copies. The destination is reread on every landing.
 //!
 //! shortcut: by kind, not by texture: textures of those kinds the title never
 //! reads are copied back too (about a megabyte per such list). The copy shows
@@ -126,7 +128,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: crate::host::TextureReadback,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -177,11 +179,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = host.texture_readback_buffer(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer.resource()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -197,9 +199,20 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+// Adapted from Taynan Piza's per-worker texture scratch in TaynanGT/Vice-Tay
+// PR #166 (f0019f2e). This tree also lands on synchronous submission threads.
+#[derive(Default)]
+struct Scratch {
+    pixels: Vec<u8>,
+    tiling: victory_formats::texture::TilingCache,
+}
+
+// The default water textures fit comfortably. Avoid pinning an arbitrarily
+// large title allocation on every landing thread with custom selectors.
+const MAX_RETAINED_PIXELS: usize = 4 << 20;
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
-    static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -212,17 +225,49 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    static REUSE: OnceLock<bool> = OnceLock::new();
+    if size <= MAX_RETAINED_PIXELS
+        && *REUSE.get_or_init(|| std::env::var_os("VICTORY_RX_TEX_READ").is_some_and(|v| v == "1"))
+    {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+        }
+        SCRATCH.with_borrow_mut(|scratch| {
+            let Scratch { pixels, tiling } = scratch;
+            if pixels.len() < size {
+                pixels.reserve_exact(size - pixels.len());
+                pixels.resize(size, 0);
+            }
+            land_into(back, at, &mut pixels[..size], Some(tiling));
+        });
+    } else {
+        land_into(back, at, &mut vec![0; size], None);
+    }
+}
+
+// Called with the mapping and ticket guards held through the final write.
+fn land_into(
+    back: &Back,
+    at: usize,
+    tiled: &mut [u8],
+    mut cache: Option<&mut victory_formats::texture::TilingCache>,
+) {
+    static COPIED: AtomicU64 = AtomicU64::new(0);
+    let size = tiled.len();
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
+    let buffer = back.buffer.resource();
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-            return;
-        }
+    if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() {
+        return;
+    }
+    if data.is_null() {
+        // SAFETY: Map succeeded, even though it supplied no pointer.
+        unsafe { buffer.Unmap(0, None) };
+        return;
     }
     for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
         let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
@@ -231,23 +276,79 @@ pub(crate) fn land(back: &Back) {
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let depth_pitch = pitch * rows as usize;
+        let result = match cache.as_deref_mut() {
+            Some(cache) => cache.tile(&back.layout, tiled, (mip, slice), linear, (pitch, depth_pitch)),
+            None => back.layout.tile(tiled, mip, slice, linear, pitch, depth_pitch),
+        };
+        if let Err(e) = result {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { buffer.Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        let stats = back.buffer.stats();
+        tracing::info!(
+            copied,
+            bytes = size,
+            created = stats.created,
+            reused = stats.reused,
+            allocation_failures = stats.allocation_failures,
+            allocation_us = stats.allocation_us,
+            peak_allocation_us = stats.peak_allocation_us,
+            active_buffers = stats.active_buffers,
+            active_bytes = stats.active_bytes,
+            peak_active_bytes = stats.peak_active_bytes,
+            idle_bytes = stats.idle_bytes,
+            peak_idle_bytes = stats.peak_idle_bytes,
+            "texture readback landed"
+        );
     }
 }
 
+/// Register the initialized upload row copied by the host's test list as a
+/// linear 1×1 readback, so it goes through the real landing/reset path.
+#[cfg(test)]
+pub(crate) fn buffer_back_for_test(buffer: crate::host::TextureReadback, dst: &mut [u8; 256]) -> Back {
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    let layout = Layout::new(&Desc {
+        dimension: Dimension::Tex2d,
+        width: 1,
+        height: 1,
+        depth: 1,
+        mips: 1,
+        element_bytes: 4,
+        block: 1,
+        samples: 1,
+        swizzle: Swizzle::LINEAR,
+    }).unwrap();
+    assert_eq!(layout.size, dst.len() as u64);
+    let at = dst.as_mut_ptr() as usize;
+    Back {
+        buffer,
+        footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                Width: 1,
+                Height: 1,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        }],
+        rows: vec![1],
+        mips: 1,
+        layout,
+        ticket: track(at, at, at + dst.len()),
+    }
+}
 
 #[cfg(test)]
 mod tests {

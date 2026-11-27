@@ -71,7 +71,7 @@ static STACK: AtomicPtr<[usize; DEPTH]> = AtomicPtr::new(std::ptr::null_mut());
 static NEXT_STACK: AtomicUsize = AtomicUsize::new(0);
 
 /// [`ticks`] per second.
-pub(super) fn frequency() -> u64 {
+pub(crate) fn frequency() -> u64 {
     static TICKS: OnceLock<u64> = OnceLock::new();
     *TICKS.get_or_init(|| {
         let mut ticks = 0;
@@ -517,7 +517,14 @@ pub(crate) fn presented() {
     let Some(&after) = asked.after.get(stage.made) else {
         return;
     };
-    if stage.writing || asked.started.elapsed().as_secs_f64() < after {
+    static WORLD_FRAME: OnceLock<Option<u64>> = OnceLock::new();
+    let world_frame = WORLD_FRAME.get_or_init(|| std::env::var("VICTORY_TIMELINE_WORLD_FRAME").ok()?.parse().ok());
+    static WORLD_MS: OnceLock<Option<u64>> = OnceLock::new();
+    static WORLD_START: OnceLock<std::time::Instant> = OnceLock::new();
+    let world_ms = WORLD_MS.get_or_init(|| std::env::var("VICTORY_TIMELINE_WORLD_MS").ok()?.parse().ok());
+    let age_ms = world_ms.and_then(|_| crate::capture::world_age().map(|_| WORLD_START.get_or_init(std::time::Instant::now).elapsed().as_millis()));
+    if stage.writing || asked.started.elapsed().as_secs_f64() < after
+        || world_frame.is_some_and(|n| crate::capture::world_age().is_none_or(|at| at < n)) {
         return;
     }
     if !stage.ready {
@@ -526,6 +533,9 @@ pub(crate) fn presented() {
         stage.ready = true;
         make_room();
         crate::host::timeline_ready();
+        return;
+    }
+    if world_ms.is_some_and(|n| age_ms.is_none_or(|ms| ms < u128::from(n))) {
         return;
     }
     if !stage.began {

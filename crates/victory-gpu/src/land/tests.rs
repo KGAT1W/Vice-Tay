@@ -66,6 +66,75 @@ fn the_pool_calls_every_number_once() {
     }
 }
 
+/// Independent callers borrow different output slots, then consume them in
+/// index order (as each_view's ordered merge does). Compare both policies.
+#[test]
+fn short_tail_batches_match_with_competing_callers() {
+    let legacy = Pool::with_tail("victory-views", 4, false);
+    let short = Pool::with_tail("victory-views", 4, true);
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|s| {
+        for caller in 0..4usize {
+            let start = &start;
+            s.spawn(move || {
+                start.wait();
+                for round in 0..50 {
+                    let count = [0, 1, 2, 5, 173][(caller + round) % 5];
+                    let run = |pool: &Pool| {
+                        let slots: Vec<OnceLock<_>> = (0..count).map(|_| OnceLock::new()).collect();
+                        pool.each(count, &|i| {
+                            slots[i].set((caller, round, i)).expect("one job per slot");
+                        });
+                        slots.into_iter().map(|s| s.into_inner().expect("joined")).collect::<Vec<_>>()
+                    };
+                    let expected = run(legacy);
+                    assert_eq!(run(short), expected);
+                }
+            });
+        }
+    });
+}
+
+/// Force one call onto the helper. On caller panic it must finish even
+/// after the batch closes. On helper panic only its own caller is notified.
+#[test]
+fn short_tail_joins_and_reports_panics_on_either_thread() {
+    let pool = Pool::with_tail("victory-records", 2, true);
+    for caller_panics in [true, false] {
+        let caller = std::thread::current().id();
+        let (started, entered) = std::sync::mpsc::channel();
+        let entered = Mutex::new(entered);
+        let completed = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.each(2, &|_| {
+                let on_caller = std::thread::current().id() == caller;
+                if on_caller {
+                    entered.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("helper started");
+                    assert!(!caller_panics, "(expected caller panic)");
+                } else {
+                    started.send(()).unwrap();
+                    // The caller is now either joining normally or unwinding
+                    // its job. Finish only once it has closed admission.
+                    let start = std::time::Instant::now();
+                    while pool.state().work.is_some() {
+                        assert!(start.elapsed() < std::time::Duration::from_secs(5), "caller did not close batch");
+                        std::thread::yield_now();
+                    }
+                    completed.store(true, Ordering::Relaxed);
+                    assert!(caller_panics, "(expected helper panic)");
+                }
+            });
+        }));
+        assert!(result.is_err());
+        assert!(completed.load(Ordering::Relaxed));
+        let total = AtomicUsize::new(0);
+        pool.each(9, &|i| {
+            total.fetch_add(i, Ordering::Relaxed);
+        });
+        assert_eq!(total.into_inner(), 36);
+    }
+}
+
 /// A job that panics is told to the caller, and the pool goes on.
 #[test]
 fn a_panicking_job_reaches_the_caller() {

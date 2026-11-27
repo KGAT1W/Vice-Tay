@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
+use crate::host::allocation::Kind;
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
@@ -199,11 +200,13 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    grown: u64,
+    dropped: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, grown: 0, dropped: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -295,6 +298,7 @@ impl<B: Clone> Pool<B> {
             }
         };
         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.grown += 1;
         i
     }
 
@@ -329,6 +333,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.dropped += 1;
                     }
                 }
             }
@@ -337,6 +342,14 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    fn sample(&self, align: u64) -> [u64; 4] {
+        let quarantined = self.resting.iter().map(|(_, p)| p.len).sum();
+        let largest = self.blocks.iter().flatten().flat_map(|b| &b.free.0)
+            .map(|(&start, &len)| (start + len).saturating_sub(start.next_multiple_of(align)))
+            .max().unwrap_or(0);
+        [self.grown, self.dropped, quarantined, largest]
     }
 }
 
@@ -348,6 +361,11 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+
+/// Skip a busy pool instead of queuing the meter behind a driver allocation.
+pub(crate) fn allocation_sample() -> Option<[u64; 4]> {
+    Some(TEXTURES.try_lock().ok()?.sample(64 << 10))
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -363,7 +381,7 @@ pub(crate) fn texture_room() -> u64 {
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
+#[cfg(feature = "panel")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
@@ -477,16 +495,20 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 /// first level of 32 KiB from there ends 0x2000 past the piece. Why the card
 /// faulted there is not proven; textures at 64 KiB multiples have none of
 /// that, for some memory (at most 60 KiB a small texture).
-fn small_placement() -> bool {
+fn small_placement(mip_levels: u16) -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_POOL_SMALL") {
-        Some(v) => v != "0",
-        None => !crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)),
-    })
+    // The RX 7600 profile packs single-level textures only. Keep the
+    // conservative alignment for chains (including implicit chains).
+    static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let &(all, single) = MODE.get_or_init(|| match std::env::var_os("VICTORY_POOL_SMALL") {
+        Some(v) if v == "single" => (false, true),
+        Some(v) => (v != "0", false),
+        None => (!crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)), false),
+    });
+    all || single && mip_levels == 1
 }
 
 /// Diagnostics: whether the card reads a pooled texture inside the piece it
@@ -657,10 +679,10 @@ pub(crate) unsafe fn texture(
     // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
+    d.Alignment = if small_placement(d.MipLevels) { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
+    if d.Alignment != 0 && (info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment) {
         d.Alignment = 0;
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
@@ -677,12 +699,12 @@ pub(crate) unsafe fn texture(
         };
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        if let Err(e) = Kind::TextureHeap.create(|| unsafe { device.CreateHeap(&desc, &mut heap) }) {
             crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            && let Err(e) = crate::host::resident(device, h, Kind::TextureHeap).and_then(|()| crate::host::mapped(device, Kind::TextureHeap))
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
@@ -692,7 +714,7 @@ pub(crate) unsafe fn texture(
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
-    let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
+    let result = Kind::PlacedTexture.create(|| unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) });
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
@@ -729,6 +751,16 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_distinguishes_resting_bytes_from_aligned_free_space() {
+        let mut pool = Pool::new(0);
+        let (part, _, _) = pool.take(4096, 4096, 0, || Some(())).unwrap();
+        pool.give(part, 0);
+        assert_eq!(pool.sample(65536), [1, 0, 4096, BLOCK - 65536]);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.sample(65536), [1, 1, 0, 0]);
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

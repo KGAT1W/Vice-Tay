@@ -398,7 +398,10 @@ impl Trace {
                         from: at.max(until),
                         to: w.t1,
                         thread,
-                        cause: "woken, not running yet".into(),
+                        // Matching an address doesn't identify which waiter
+                        // the kernel readied. Only ReadyThread/CSwitch can
+                        // separate runnable delay from time still blocked.
+                        cause: "matched signal attempt to wait return".into(),
                     });
                     (thread, t) = (other, at);
                 }
@@ -767,7 +770,7 @@ pub(super) fn chrome(
             }
         }
     }
-    writeln!(out, "\n]}}")
+    writeln!(out, "\n],\"qpc_start\":{start},\"qpc_frequency\":{},\"process_id\":{}}}", frequency(), std::process::id())
 }
 
 /// Writes both files.
@@ -843,7 +846,7 @@ mod tests {
             [
                 (1, 1900, 2000, "present"),
                 (1, 1850, 1900, OUTSIDE),
-                (1, 1840, 1850, "woken, not running yet"),
+                (1, 1840, 1850, "matched signal attempt to wait return"),
                 (2, 1800, 1840, "landing"),
                 (2, 1750, 1800, "merging"),
                 (2, 1700, 1750, "landing"),

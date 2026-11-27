@@ -500,7 +500,8 @@ fn twin_texture(
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout, as in `host_texture`;
     // the out pointer is ours.
-    let made = unsafe {
+    use crate::host::allocation::Kind;
+    let made = Kind::DepthTwin.create(|| unsafe {
         host.device.CreateCommittedResource(
             &heap,
             crate::host::not_resident(),
@@ -509,7 +510,7 @@ fn twin_texture(
             None,
             &mut texture,
         )
-    };
+    });
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
@@ -517,7 +518,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::host::resident(&host.device, &texture, Kind::DepthTwin);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -564,7 +565,7 @@ fn twin_texture(
         };
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: as for the first twin.
-        let made = unsafe {
+        let made = Kind::DepthTwin.create(|| unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 crate::host::not_resident(),
@@ -573,12 +574,12 @@ fn twin_texture(
                 None,
                 &mut texture,
             )
-        };
+        });
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::host::resident(&host.device, &texture, Kind::DepthTwin);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1187,11 +1188,8 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
-    /// Made whole from the store (`crate::texstore`): its levels below the
-    /// first one title memory holds, until a list copies them; then how
-    /// many levels the copy put in (its views show them).
-    pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
-    pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// Cached levels to upload, and the levels published by a submission.
+    pub(crate) prefill: Option<std::sync::Arc<crate::texture::Prefill>>,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -1661,7 +1659,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
-        *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
+        host.prefill = prefill.map(crate::texture::Prefill::new);
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2364,8 +2362,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
-            prefill: Default::default(),
-            prefilled: Default::default(),
+            prefill: None,
             flags,
         }
     }
@@ -2391,8 +2388,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
-            prefill: Default::default(),
-            prefilled: Default::default(),
+            prefill: None,
             flags,
         }
     }
@@ -2570,7 +2566,13 @@ fn host_texture_as(
         return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    use crate::host::allocation::Kind;
+    let kind = if reserved { Kind::Reserved }
+        else if d.flags & DEPTH != 0 { Kind::DepthTarget }
+        else if d.flags & TARGET != 0 { Kind::RenderTarget }
+        else if d.flags & UNORDERED != 0 { Kind::UavTexture }
+        else { Kind::Texture };
+    let made = kind.create(|| if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2601,7 +2603,7 @@ fn host_texture_as(
                 &mut texture,
             )
         }
-    };
+    });
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
@@ -2609,7 +2611,7 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident(&host.device, t, kind).and_then(|()| crate::host::mapped(&host.device, kind))
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
@@ -3878,6 +3880,98 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// An earlier title-memory upload must not suppress a later alias copy
+    /// from a GPU-written probe atlas into the same sampled texture.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

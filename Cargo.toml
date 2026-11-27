@@ -77,3 +77,17 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Frame-sampled player build: keep this binary separate from both controls.
+[profile.sampled]
+inherits = "release"
+
+# Candidate RX build. Keep target/release/victory.exe as the playable A/B control.
+[profile.rxnext]
+inherits = "release"
+
+# Final RX 7600 experiment: whole-program inlining, isolated from the playable Next binary.
+[profile.rxfinal]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

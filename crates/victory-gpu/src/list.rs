@@ -121,6 +121,8 @@ struct List {
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
+    handoff: thin::Handoff,
+    #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
     /// list is cut at its waits for memory values ([`cut`]).
@@ -277,6 +279,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+#[cfg(windows)]
+impl List {
+    fn replace_host(&mut self, fresh: crate::host::HostList) -> Option<crate::host::HostList> {
+        self.handoff.replace(&mut self.host, fresh, crate::host::HostList::close)
+    }
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -383,7 +392,7 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
+/// and leaves each list a replacement host list for its next reset, as
 /// [`detach`] does. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
 /// waits join the entry before them. The list's upload memory and draw
@@ -417,13 +426,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(fresh) = fresh_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = list.replace_host(fresh) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -472,7 +478,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 }
 
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
+/// submission names it) and leaves each list a replacement host list for
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
@@ -489,14 +495,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let Some(fresh) = fresh_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).replace_host(fresh) else {
                 continue;
             };
             let uploads =
@@ -625,6 +628,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
             }
         }),
         #[cfg(windows)]
+        handoff: thin::Handoff::Normal,
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -689,16 +694,23 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
-    {
+    let open_spare = {
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
-    }
+        list.handoff.take_open()
+    };
     #[cfg(windows)]
     with_state(this, |host, state| {
-        host.reset();
+        if open_spare {
+            // Already open and clean from fresh_list. Start a new cache epoch
+            // just as a native reset would.
+            host.changed_something();
+        } else {
+            host.reset();
+        }
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
@@ -1462,14 +1474,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             with_state(this, |_, state| state.copied());
             return;
         }
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer_raw_copy(dst as usize, src as usize, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);

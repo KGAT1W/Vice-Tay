@@ -893,10 +893,11 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
-        const PIECE: usize = 64 << 10;
+        let source = crate::host::card_compare_source();
+        let compare = compile_cs(&warp.device, &source).expect("the card compare must compile on WARP");
+        let piece_bytes = crate::shadow::card_piece_bytes();
         const PIECES: u32 = 3;
-        let size = PIECE * PIECES as usize;
+        let size = piece_bytes * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
@@ -930,12 +931,12 @@ void main() {
             // Above the flag, the hash: as `host::torn` makes it of the bytes.
             for (piece, d) in found.iter().enumerate() {
                 // SAFETY: inside the mapping, which the card has read.
-                let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece * PIECE).cast_const(), PIECE) };
+                let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece * piece_bytes).cast_const(), piece_bytes) };
                 assert_eq!(d >> 1, crate::host::piece_hash(bytes), "piece {piece}");
             }
             found.map(|d| d & 1)
         };
-        let at = PIECE + 1234;
+        let at = piece_bytes + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.

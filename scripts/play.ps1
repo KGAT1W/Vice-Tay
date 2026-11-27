@@ -4,9 +4,11 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Windowed     a window instead of the whole screen (full screen is the default)
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
-# -Console      series-x (the default) or series-s: the console the title takes this PC for
-# -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070 or 4090
+# -Console      series-x or series-s (default on RX 7600; series-x elsewhere)
+# -Build        target\diag (default), target\release, or target\sampled
+#               (cargo build --profile sampled -p victory --features frame-samples)
+#               target\rxnext: separate RX candidate (cargo build --locked --profile rxnext -p victory --features diagnostics)
+# -Machine      auto (the default: by the graphics card), 7600, 7900xtx, 4070 or 4090
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -19,8 +21,8 @@ param(
     [switch]$Windowed,
     [switch]$NoPanel,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4090')][string]$Machine = 'auto',
+    [ValidateSet('diag', 'release', 'sampled', 'rxnext', 'rxfinal')][string]$Build = 'diag',
+    [ValidateSet('auto', '7600', '7900xtx', '4070', '4090')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -31,10 +33,35 @@ $settings = @{
 }
 if ($Machine -eq 'auto') {
     # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
-    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
-    $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+    $Machine = if ($cards.PNPDeviceID -match 'VEN_10DE') { '4090' }
+               elseif ($cards.Name -match '\bRX\s+7600\s*$') { '7600' }
+               else { '7900xtx' }
 }
-if ($Machine -eq '7900xtx') {
+if ($Machine -eq '7600') {
+    if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-s' }
+    # The Series S FSR DLL ships fixed 1080p tables. Use the game's
+    # own scaler, keeping texture streaming and shader quality intact.
+    $settings.VICTORY_OUTPUT = '1280x720'
+    $settings.VICTORY_UPSCALER = '6'
+    $settings.VICTORY_RENDER_SCALE = '0.8'
+    $settings.VICTORY_MAP_THREADS = '1'
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    $settings.VICTORY_CARD_BUFFERS_MB = '1024'
+    $settings.VICTORY_AMBIENT = '1.0'
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+    # The tiled path disables held-only copies even for textures it can't
+    # tile. Copy the mips visible to guest views and grow on finer views.
+    $settings.VICTORY_LEVELS_ON_DEMAND = '0'
+    $settings.VICTORY_HELD_LEVELS = '1'
+    # Keep the regular shader cache and constant-buffer bindings on RX 7600.
+    $settings.VICTORY_PORT_CONSTANTS = '0'
+    $settings.VICTORY_PORT_CBV = '0'
+    if (-not $Safe) {
+        $settings.VICTORY_POOL_SMALL = 'single'
+        $settings.VICTORY_PLACED_ORDER = '1'
+    }
+} elseif ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
     # thread, and the AMD driver lowers its clocks between submissions.
     $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_CARD_AWAKE = '1'

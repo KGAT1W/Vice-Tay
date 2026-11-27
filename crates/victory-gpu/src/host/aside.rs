@@ -16,7 +16,68 @@ use super::*;
 pub(crate) type Refresh = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
 
 /// What is being found, until it is.
-pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar);
+pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar,
+    #[cfg(feature = "diagnostics")] Option<Box<measure::Job>>);
+
+#[cfg(feature = "diagnostics")]
+mod measure {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::{GetCurrentThread, GetCurrentThreadId, GetThreadTimes}};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+    }
+    pub(super) use crate::timeline::ticks;
+    pub(super) struct Job {
+        queued: u64,
+        start: AtomicU64,
+        pub(super) ready: AtomicU64,
+        producer: AtomicU64,
+        cpu_100ns: AtomicU64,
+        cycles: AtomicU64,
+    }
+    pub(super) fn counters() -> (u64, u64) {
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let val = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        let mut cycles = 0;
+        // SAFETY: pseudo-handle for the calling thread and valid outputs.
+        unsafe {
+            let h = GetCurrentThread();
+            let cpu = if GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 { val(k) + val(u) } else { 0 };
+            QueryThreadCycleTime(h, &mut cycles);
+            (cpu, cycles)
+        }
+    }
+    impl Job {
+        pub(super) fn new() -> Option<Box<Self>> {
+            static ON: OnceLock<bool> = OnceLock::new();
+            // Not tied to the timeline's few frames: a system trace
+            // (scripts/trace-close-wait.ps1) is taken whenever the scene is
+            // on screen, and its events are matched by these QPC values.
+            if !*ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_CLOSE_TIMING")) { return None; }
+            Some(Box::new(Self { queued: ticks(), start: 0.into(), ready: 0.into(), producer: 0.into(), cpu_100ns: 0.into(), cycles: 0.into() }))
+        }
+        pub(super) fn start(&self) -> (u64, u64) {
+            self.producer.store(u64::from(unsafe { GetCurrentThreadId() }), Ordering::Relaxed);
+            self.start.store(ticks(), Ordering::Relaxed);
+            counters()
+        }
+        pub(super) fn finish(&self, before: (u64, u64)) {
+            let after = counters();
+            self.cpu_100ns.store(after.0.saturating_sub(before.0), Ordering::Relaxed);
+            self.cycles.store(after.1.saturating_sub(before.1), Ordering::Relaxed);
+        }
+        pub(super) fn report(&self, wait: u64, resumed: u64) {
+            tracing::info!(target: "victory_gpu::heap_close", queued=self.queued, start=self.start.load(Ordering::Relaxed),
+                ready=self.ready.load(Ordering::Relaxed), wait, resumed, producer=self.producer.load(Ordering::Relaxed),
+                consumer=unsafe { GetCurrentThreadId() }, cpu_100ns=self.cpu_100ns.load(Ordering::Relaxed),
+                cycles=self.cycles.load(Ordering::Relaxed), freq=crate::timeline::frequency(), pid=std::process::id(),
+                "heap pass QPC");
+        }
+    }
+}
 
 /// Since the last frame line: microseconds lists waited at their close.
 pub(crate) static WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -26,10 +87,14 @@ impl Coming {
     pub(crate) fn wait(&self) -> Vec<Refresh> {
         let began = std::time::Instant::now();
         let _waiting = crate::timeline::span("a list's close waits for the heap's views");
+        #[cfg(feature = "diagnostics")]
+        let wait = self.2.as_ref().map(|_| measure::ticks());
         let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(found) = found.take() {
                 WAITED.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if let (Some(job), Some(wait)) = (&self.2, wait) { job.report(wait, measure::ticks()); }
                 return found;
             }
             found = self.1.wait(found).unwrap_or_else(|e| e.into_inner());
@@ -37,7 +102,12 @@ impl Coming {
     }
 
     fn found(&self, what: Vec<Refresh>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(what);
+        {
+            let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(what);
+            #[cfg(feature = "diagnostics")]
+            if let Some(job) = &self.2 { job.ready.store(measure::ticks(), Ordering::Relaxed); }
+        }
         self.1.notify_all();
     }
 }
@@ -53,12 +123,17 @@ type Job = Box<dyn FnOnce() + Send>;
 /// there is no such thread.
 pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std::sync::Arc<Coming> {
     static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
-    let coming = std::sync::Arc::new(Coming(Mutex::new(None), std::sync::Condvar::new()));
+    let coming = std::sync::Arc::new(Coming(Mutex::new(None), std::sync::Condvar::new(),
+        #[cfg(feature = "diagnostics")] measure::Job::new()));
     let told = coming.clone();
     let job: Job = Box::new(move || {
         // (However it ends, the list that waits goes on.)
         let _aside = crate::timeline::span("beside: the heap's views");
+        #[cfg(feature = "diagnostics")]
+        let before = told.2.as_ref().map(|job| job.start());
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_default();
+        #[cfg(feature = "diagnostics")]
+        if let (Some(job), Some(before)) = (&told.2, before) { job.finish(before); }
         told.found(found);
     });
     let thread = THREAD.get_or_init(|| {

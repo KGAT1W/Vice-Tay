@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::descriptor::ConstantSlot;
 use crate::shadow::Shadow;
 
 /// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
@@ -253,6 +254,17 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
 fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+    // With only reads there cannot be a dependency between two fills:
+    // every requested fill can run at level zero in original list order.
+    // Leave copies, any unsupported operation and refusal reasons to the
+    // general planner. Avoid building and sorting thousands of read ranges.
+    if does.iter().all(|d| matches!(d, Does::Refresh { .. } | Does::Read { asked: false, .. }
+        | Does::Fill { asked: false, .. } | Does::Fill { to: true, .. })) {
+        let out: Vec<_> = does.iter().enumerate().filter_map(|(i, d)| {
+            matches!(d, Does::Fill { asked: true, .. }).then_some((i, 0))
+        }).collect();
+        return if out.len() <= MOST { Ok(out) } else { Err("too many steps depend on it") };
+    }
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -387,9 +399,9 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
-fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+fn holder<'a>(writers: impl IntoIterator<Item = &'a Writer>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
+    for w in writers.into_iter().filter(|w| meet((w.from, w.to), (from, to))) {
         match (&w.shadow, found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
@@ -407,14 +419,36 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(shadow)
 }
 
-/// What the steps of `runs` do, and which step each is (its list by address,
+/// Index the immutable flight writers once per plan. The prefix maximum
+/// also finds long ranges starting well before the requested address.
+struct WriterIndex {
+    sorted: Vec<Writer>,
+    ends: Vec<usize>,
+}
+
+impl WriterIndex {
+    fn new(mut sorted: Vec<Writer>) -> Self {
+        sorted.sort_unstable_by_key(|w| w.from);
+        let mut end = 0;
+        let ends = sorted.iter().map(|w| { end = end.max(w.to); end }).collect();
+        Self { sorted, ends }
+    }
+
+    fn near(&self, from: usize, to: usize) -> &[Writer] {
+        let end = self.sorted.partition_point(|w| w.from < to);
+        let first = self.ends[..end].partition_point(|&e| e <= from);
+        &self.sorted[first..end]
+    }
+}
+
+/// What the steps of `runs` do, and which step each is (its list index,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
-    for list in runs {
+    for (list_index, list) in runs.iter().enumerate() {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
@@ -448,11 +482,11 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
-                Step::Run(_) => Does::Run,
+                Step::RawCopy { .. } => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((list_index, i));
         }
     }
     (does, steps)
@@ -479,9 +513,8 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
         return None;
     }
     let (placed, reader) = behind?;
-    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
-    let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let cut = steps[placed].0 + 1;
+    (steps[reader].0 >= cut).then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -504,16 +537,6 @@ fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
 
-/// Where the bytes of the fill that is `step` (its list by address, its place
-/// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
-    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
-    match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
-        _ => None,
-    }
-}
-
 /// A step done on the card.
 struct Op {
     from: (Arc<Shadow>, usize),
@@ -532,6 +555,24 @@ enum To {
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
 }
+
+fn cbv_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RX_CBV_BATCH").is_some_and(|v| v == "1"))
+}
+
+const SLOT_PARTS: usize = 8;
+
+fn pack_slots(slots: impl Iterator<Item = ConstantSlot>, parts: usize) -> [Vec<ConstantSlot>; SLOT_PARTS] {
+    let mut lanes: [Vec<_>; SLOT_PARTS] = Default::default();
+    for slot in slots {
+        lanes[slot.index as usize / 4 % parts].push(slot);
+    }
+    lanes
+}
+
+// Packed slots, live-host writes, registry locks. Updated once per nonempty worker.
+static CBV_BATCHED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
@@ -693,15 +734,16 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
-        let mut writers = {
+        let flight_writers = {
             let line = line();
             let mut all = writers(&line.line);
             all.extend(line.landing.iter().map(|w| Writer {
                 shadow: w.shadow.clone(),
                 ..*w
             }));
-            all
+            WriterIndex::new(all)
         };
+        let mut earlier_copies = Vec::new();
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -711,7 +753,17 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
-        for &(i, level) in &chosen {
+        // Read the destinations under one lock per list occurrence. No
+        // list lock is held while looking up writers, mappings or heaps.
+        let mut targets = Vec::with_capacity(chosen.len());
+        for group in chosen.chunk_by(|a, b| steps[a.0].0 == steps[b.0].0) {
+            let list = runs[steps[group[0].0].0].deferred();
+            targets.extend(group.iter().map(|&(i, _)| match &list.copies[steps[i].1] {
+                Step::Fill(_, _, _, to) => to.clone(),
+                _ => None,
+            }));
+        }
+        for (&(i, level), target) in chosen.iter().zip(targets) {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
             };
@@ -724,7 +776,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder(flight_writers.near(src, src + len).iter().chain(&earlier_copies), src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -747,7 +799,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = holder(flight_writers.near(dst, dst + len).iter().chain(&earlier_copies), dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -756,7 +808,7 @@ impl Host {
                     }
                     // What the steps behind it read of it is in that host
                     // copy, or nowhere.
-                    writers.push(Writer {
+                    earlier_copies.push(Writer {
                         shadow: Some(to.clone()),
                         from: dst,
                         to: dst + len,
@@ -765,7 +817,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match target {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -810,24 +862,28 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
-        let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
-        for level in 0..=levels {
-            let mut reads = Vec::new();
-            let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
-                let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
+        if reads::enabled() {
+            reads::record(&own, &ops, end);
+        } else {
+            let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+            for level in 0..=levels {
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                for op in ops.iter().filter(|op| op.level == level) {
+                    let len = op.len as u64;
+                    let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
+                    // (Each place once.)
+                    if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                        reads.push(read);
+                    }
+                    match &op.to {
+                        To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
+                        To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                        To::Slot(..) => {}
+                    }
                 }
-                match &op.to {
-                    To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
-                    To::Slot(..) => {}
-                }
+                record(level == 0, &own.list.list, &own.between, &reads, &writes);
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -836,17 +892,33 @@ impl Host {
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
         // order.)
-        let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+        let parts = if ops.len() < 256 { 1 } else { SLOT_PARTS };
+        if cbv_batch() {
+            let lanes = pack_slots(ops.iter().filter_map(|op| match op.to {
+                To::Slot(heap, index) => Some(ConstantSlot { heap, index, gpu: gpu + op.at, size: op.len as u32 }),
+                _ => None,
+            }), parts);
+            crate::land::each_under(parts, &|part| {
+                let slots = &lanes[part];
+                if !slots.is_empty() {
+                    let (locks, bound) = crate::descriptor::constant_slots(slots, &own.between);
+                    for (counter, n) in CBV_BATCHED.iter().zip([slots.len(), bound, locks]) {
+                        counter.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            crate::land::each_under(parts, &|part| {
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        // (A heap that is gone: nothing can read the slot.)
+                        crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    }
+                }
+            });
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -856,7 +928,10 @@ impl Host {
         spent.end();
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: chosen.iter().map(|&(i, _)| {
+                let (list, index) = steps[i];
+                (std::ptr::from_ref(runs[list]) as usize, index)
+            }).collect(),
             copied,
         }))
     }
@@ -902,7 +977,12 @@ pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
     }
+    reads::log(frames);
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if cbv_batch() {
+        let [packed, bound, locks] = CBV_BATCHED.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!("GPU fill CBV batches per frame (VICTORY_RX_CBV_BATCH=1): {packed:.1} packed slots, {bound:.1} live-host writes, {locks:.1} heap read locks");
+    }
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
          copies, {:.1} KB; {:.2} submissions refused and waited",
@@ -950,6 +1030,48 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbv_batch_packing_matches_per_worker_scan() {
+        let slots: Vec<_> = (0..521u32).map(|n| {
+            (n % 7 != 0).then_some(ConstantSlot {
+                heap: (n % 3) as usize,
+                index: [0, 3, 4, 31, 32, 4, 99, u32::MAX][n as usize % 8],
+                gpu: 0x10000 + u64::from(n) * 256,
+                size: n + 1,
+            })
+        }).collect();
+        for count in [0, 1, 255, 256, slots.len()] {
+            let parts = if count < 256 { 1 } else { SLOT_PARTS };
+            let ops = &slots[..count];
+            let packed = pack_slots(ops.iter().flatten().copied(), parts);
+            for (part, lane) in packed.iter().enumerate() {
+                let mut expected = Vec::new();
+                for slot in ops.iter().flatten() {
+                    if slot.index as usize / 4 % parts == part {
+                        expected.push(*slot);
+                    }
+                }
+                assert_eq!(lane, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_writers_find_every_intersection() {
+        let ranges = [(64, 80), (8, 1200), (1600, 2000), (0, 10), (32, 48), (64, 92)];
+        let index = WriterIndex::new(ranges.iter().map(|&(from, to)| Writer { from, to, shadow: None, copy: false }).collect());
+        for from in (0..2100).step_by(2) {
+            for len in [1, 16, 100, 1024] {
+                let query = (from, from + len);
+                let mut found: Vec<_> = index.near(query.0, query.1).iter().map(|w| (w.from, w.to)).filter(|&r| meet(r, query)).collect();
+                let mut expected: Vec<_> = ranges.iter().copied().filter(|&r| meet(r, query)).collect();
+                expected.sort_unstable();
+                found.sort_unstable();
+                assert_eq!(found, expected);
+            }
+        }
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
@@ -1343,3 +1465,4 @@ mod tests {
         assert!(done >= 20, "only {done} copies were done on the card");
     }
 }
+mod reads;

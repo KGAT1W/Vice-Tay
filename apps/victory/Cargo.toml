@@ -25,6 +25,10 @@ tracing.workspace = true
 tempfile.workspace = true
 
 [features]
+panel = ["victory-hle/panel"]
+# Low-overhead play measurements: accepted presents and requested back-buffer
+# screenshots without per-draw diagnostic records or pipeline debug switches.
+frame-samples = ["victory-hle/frame-samples"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

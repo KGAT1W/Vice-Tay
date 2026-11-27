@@ -173,16 +173,17 @@ PowerShell asks for the executable's path.
 
 | Option | What it does |
 |---|---|
-| (none) | Full screen, Series X profile, settings picked for your graphics card, performance panel on |
+| (none) | Full screen, settings picked for your graphics card, performance panel on. RX 7600 defaults to Series S; other profiles default to Series X. |
 | **F11** or **Alt+Enter** | Switch between full screen and a window while it runs |
 | **F3** | Hide or show the performance panel |
 | `-NoPanel` | Start without the performance panel |
 | `-Windowed` | Start in a window |
 | `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile every session uses |
 | `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
+| `-Machine 7600` | RX 7600 (8 GB): requests 1280×720 output at 80% internal scale using the title's own scaler. Copies texture levels starting at the finest level requested by the game and grows the copy when needed. Keeps the normal texture upload time and catch-up budgets. |
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
 | `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
-| `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
+| `-Build release` | Run `target\release\victory.exe`. Build with `cargo build --release --locked -p victory --features panel` for the FPS overlay without per-draw diagnostics, or omit `--features panel` for a plain release. |
 
 Every `VICTORY_...` switch is described in a comment where the code reads it.
 More commands and debugging switches:
@@ -239,3 +240,32 @@ commit here is listed in [docs/credits.md](docs/credits.md).
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file it does not
 cover is named in [docs/asset-policy.md](docs/asset-policy.md).
+# RX 7600 experiment: running this branch
+
+This is a local performance study based on Vice-Tay `8edc378`, with selected
+upstream fixes. It is not a release or a replacement for upstream main.
+The code used for the two compared configurations is included. No title
+files, caches, binaries or saves are distributed.
+
+In PowerShell, build and launch **Next**:
+
+```powershell
+cargo build --locked --profile rxnext -p victory --features diagnostics
+.\Play-RX7600-VRAM-Test.cmd -Next 'D:\your-game\game_scarlett_master.exe'
+```
+
+To reproduce **Final** on a Ryzen 7 5700X, build in a fresh PowerShell:
+
+```powershell
+$env:RUSTFLAGS = '-C target-cpu=znver3'
+cargo build --locked --profile rxfinal -p victory --features frame-samples
+.\Play-RX7600-VRAM-Test.cmd -Final 'D:\your-game\game_scarlett_master.exe'
+```
+
+Both request Series S, 1280×720 output, internal scale 0.8, upscaler 6.
+Final changes several things at once (buffer landing, texture queue indexing,
+list handoff, write guards, compiler settings and instrumentation). In four
+short tests of the same opening arrest shot on an RX 7600 / 5700X, Next
+measured 12.65 and 15.19 FPS; Final measured 14.29 and 17.64. Frames over
+100 ms: 9/55 vs. 3/62. These are actual presents in one short scene, not a
+claim of stable 30 FPS or a gain attributable to any one patch.

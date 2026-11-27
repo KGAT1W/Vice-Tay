@@ -185,32 +185,48 @@ pub(crate) fn settle() {
     }
     let sets = cpu_sets();
     let fast = fast_of(&sets);
-    let one = one_core(&sets).filter(|_| lane_core());
+    let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let one = one_core(&sets).filter(|_| lane_core() && asked.iter().any(|&(_, lane)| lane));
+    // Don't exclude a core from the other threads if Windows couldn't put
+    // the submission thread there.
+    if let Some((own, _)) = &one {
+        for &(thread, _) in asked.iter().filter(|&&(_, lane)| lane) {
+            // SAFETY: live handle and set ids returned for this process.
+            if unsafe { SetThreadSelectedCpuSets(thread as _, own.as_ptr(), own.len() as u32) } == 0 {
+                tracing::warn!(error = %std::io::Error::last_os_error(), "submission CPU set not selected");
+                return;
+            }
+        }
+    }
     let others: &[u32] = one.as_ref().map_or(&[], |o| &o.1);
     let null = std::ptr::null::<u32>();
     // SAFETY: our own process and the system's own set ids (none: all).
     unsafe {
         let at = if others.is_empty() { null } else { others.as_ptr() };
-        SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32);
+        if SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32) == 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "process default CPU sets not changed");
+            for &(thread, _) in asked.iter().filter(|&&(_, lane)| lane) {
+                SetThreadSelectedCpuSets(thread as _, null, 0);
+            }
+            return;
+        }
     }
     let helpers: Vec<u32> = match &one {
         Some((own, _)) => fast.iter().copied().filter(|id| !own.contains(id)).collect(),
         None => fast.clone(),
     };
-    for &(thread, lane) in ASKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        let sets = match &one {
-            Some((own, _)) if lane => own,
-            _ => &helpers,
-        };
+    for &(thread, lane) in asked.iter() {
+        if one.is_some() && lane { continue; }
+        let sets = &helpers;
         // SAFETY: a handle kept open, and the system's own set ids.
-        unsafe { SetThreadSelectedCpuSets(thread as _, sets.as_ptr(), sets.len() as u32) };
+        unsafe { SetThreadSelectedCpuSets(thread as _, if sets.is_empty() { null } else { sets.as_ptr() }, sets.len() as u32) };
     }
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
         fast = fast.len(),
         of = sets.len(),
         by_cache = fast_by_class(&sets).is_empty() && !fast.is_empty(),
-        threads = ASKED.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        threads = asked.len(),
         "our threads' processors (VICTORY_CACHE_CORES)"
     );
 }
@@ -260,9 +276,17 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
+    // A single-CCD Ryzen has no faster subset, but an explicitly requested
+    // submission core still has to register its thread. Unregistered
+    // helpers inherit the process default (the other physical cores).
     if fast.is_empty() {
-        return;
+        #[cfg(feature = "diagnostics")]
+        let alternating = crate::ab::bit("VICTORY_LANE_CORE").is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let alternating = false;
+        if what != "victory-submit" || (!lane_core() && !alternating) || one_core(&cpu_sets()).is_none() {
+            return;
+        }
     }
     // SAFETY: our own thread; the handle stays open.
     let thread = unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
@@ -272,7 +296,9 @@ fn ask(what: &str, from: u32) {
     }
     ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit"));
     settle();
-    tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+    if !fast.is_empty() {
+        tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+    }
 }
 
 #[cfg(test)]

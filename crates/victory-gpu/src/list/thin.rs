@@ -287,14 +287,56 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// How a list receives a fresh (already open) host list on submission.
+/// Only the translator's private backs can keep it open: their next access
+/// is a translated RESET or another detach of the same closed recording.
+pub(super) enum Handoff {
+    Normal,
+    Back,
+    OpenSpare,
+}
+
+impl Handoff {
+    pub(super) fn replace<T>(&mut self, slot: &mut Option<T>, fresh: T, close: impl Fn(&T)) -> Option<T> {
+        match self {
+            Self::Normal => close(&fresh),
+            Self::Back => *self = Self::OpenSpare,
+            Self::OpenSpare => {
+                // Resubmitted before reset. The replacement is what the old
+                // path would have submitted here; close it before handing
+                // it to the queue, and leave the next spare open.
+                if let Some(spare) = slot.as_ref() {
+                    close(spare);
+                }
+            }
+        }
+        slot.replace(fresh)
+    }
+
+    pub(super) fn take_open(&mut self) -> bool {
+        if matches!(self, Self::OpenSpare) {
+            *self = Self::Back;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A logically closed back. With VICTORY_RX_LIST_NEXT=1 its unused host
+/// replacement can already be open for the first RESET of the next stream.
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let mut back = super::boxed(kind, std::ptr::null(), false);
+    static NEXT: OnceLock<bool> = OnceLock::new();
+    if *NEXT.get_or_init(|| std::env::var_os("VICTORY_RX_LIST_NEXT").is_some_and(|v| v == "1")) {
+        back.handoff = Handoff::Back;
+    }
+    let list: This = Box::into_raw(back).cast_const().cast();
     super::close(list);
     list
 }
@@ -858,6 +900,29 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_unused_translation_spare_can_skip_native_reset() {
+        use std::cell::Cell;
+        let mut mode = Handoff::Back;
+        let mut host = Some(Cell::new(true)); // real translated Close
+        let fresh = || Cell::new(false);
+        let close = |list: &Cell<bool>| assert!(!list.replace(true), "double Close");
+        assert!(!mode.take_open(), "a real recording must be reset");
+        // Resubmit twice without a reset. Each detached list is closed;
+        // its replacement remains open and is consumed by exactly one reset.
+        for _ in 0..3 {
+            assert!(mode.replace(&mut host, fresh(), close).unwrap().get());
+            assert!(!host.as_ref().unwrap().get());
+        }
+        assert!(mode.take_open());
+        assert!(!mode.take_open(), "reset of a subsequent abandoned recording is real");
+        close(host.as_ref().unwrap());
+        let mut normal = Handoff::Normal;
+        assert!(normal.replace(&mut host, fresh(), close).unwrap().get());
+        assert!(host.unwrap().get(), "ordinary lists receive closed replacements");
+        assert!(!normal.take_open());
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

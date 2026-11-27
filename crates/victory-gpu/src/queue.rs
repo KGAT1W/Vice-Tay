@@ -954,9 +954,10 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(all(windows, any(feature = "diagnostics", feature = "frame-samples")))]
+    crate::capture::frame_drew(frame, crate::draw::drawn());
     #[cfg(all(windows, feature = "diagnostics"))]
     {
-        crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             before_sync();
             crate::capture::dump_targets(frame);

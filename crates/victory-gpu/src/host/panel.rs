@@ -476,6 +476,7 @@ struct Snapshot {
     gpu_name: String,
     vram_used_gb: f64,
     vram_budget_gb: f64,
+    vram_installed_gb: f64,
     vram_shared_gb: f64,
     vram_rt_gb: f64,
     vram_tex_gb: f64,
@@ -597,8 +598,8 @@ fn paint_hud(s: &Snapshot) -> Canvas {
         WHITE
     };
     let vram_line = format!(
-        "{:.1}/{:.1} GB | SHR {:.1} GB",
-        s.vram_used_gb, s.vram_budget_gb, s.vram_shared_gb
+        "{:.1} USE {:.1} BUD {:.1} HW {:.1} SHR",
+        s.vram_used_gb, s.vram_budget_gb, s.vram_installed_gb, s.vram_shared_gb
     );
     c.text_sep(val_x, 196, 2, vram_col, &trunc(&vram_line, max_chars));
 
@@ -721,6 +722,12 @@ pub(super) struct Panel {
     since: Instant,
     frames: u32,
     last: Instant,
+    // Only for profiling: present ID and its interval in microseconds.
+    pacing_samples: Vec<(u64, u64)>,
+    pacing_last: Option<Instant>,
+    // Monotonic counters only: the asynchronous meter resets other totals.
+    interval_work_last: Option<[u64; 3]>,
+    interval_work: Vec<(u64, [u64; 3])>,
     worst: f64,
     /// What this took since the last text.
     cost: Duration,
@@ -741,6 +748,10 @@ impl Panel {
             since: now,
             frames: 0,
             last: now,
+            pacing_samples: Vec::new(),
+            pacing_last: None,
+            interval_work_last: None,
+            interval_work: Vec::new(),
             worst: 0.0,
             cost: Duration::ZERO,
             before: Counters::default(),
@@ -756,15 +767,41 @@ impl Panel {
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
-    pub(super) fn frame(&mut self, line: bool) {
+    pub(super) fn frame(&mut self, line: bool, present_id: u64) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
+            self.pacing_last = None;
+            self.pacing_samples.clear();
+            self.interval_work_last = None;
+            self.interval_work.clear();
             return;
         }
         let now = Instant::now();
+        static INTERVALS: OnceLock<bool> = OnceLock::new();
+        if *INTERVALS.get_or_init(|| crate::switch::on("VICTORY_PRESENT_INTERVALS")) {
+            static WORK: OnceLock<bool> = OnceLock::new();
+            if *WORK.get_or_init(|| crate::switch::on("VICTORY_PRESENT_WORK")) {
+                let totals = [super::worked(), crate::draw::drawn(), crate::draw::dispatched()];
+                if let Some(prev) = self.interval_work_last.replace(totals) {
+                    self.interval_work.push((present_id, std::array::from_fn(|i| totals[i].saturating_sub(prev[i]))));
+                }
+                if line {
+                    tracing::info!(target: "victory_gpu::pacing", samples = ?self.interval_work,
+                        "present work (id, [submission active us, draws, dispatches])");
+                    self.interval_work.clear();
+                }
+            }
+            if let Some(last) = self.pacing_last.replace(now) {
+                self.pacing_samples.push((present_id, (now - last).as_micros() as u64));
+            }
+            if line {
+                tracing::info!(target: "victory_gpu::pacing", samples = ?self.pacing_samples, "present intervals (id, us)");
+                self.pacing_samples.clear();
+            }
+        }
         let dt_ms = (now - self.last).as_secs_f64() * 1e3;
         if self.frames == 0 && now - self.last > 2 * EVERY {
             (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
@@ -807,6 +844,13 @@ impl Panel {
         } else {
             fps
         };
+        // Optional frame-pacing samples from accepted presents, not from
+        // the guest clock or an average over a loading screen.
+        static PACE_LOG: OnceLock<bool> = OnceLock::new();
+        if *PACE_LOG.get_or_init(|| crate::switch::on("VICTORY_PANEL_PACING")) && line {
+            tracing::info!(target: "victory_gpu::pacing", draws = c[10].round() as u64,
+                history = self.history.len(), low1_fps, worst_ms = self.worst, "present pacing");
+        }
 
         let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
         let private = process_private_bytes();
@@ -820,7 +864,7 @@ impl Panel {
         let known = rt_bytes + tex_bytes + buf_bytes + bvh_bytes;
         let oth_bytes = used.saturating_sub(known);
         let (sys_used, sys_total, sys_commit, _) = system_memory();
-        let (gpu_name, _) = gpu_info(host);
+        let (gpu_name, installed) = gpu_info(host);
 
         self.snap = Some(Snapshot {
             fps,
@@ -838,6 +882,7 @@ impl Panel {
             gpu_name: gpu_name.clone(),
             vram_used_gb: gb(used),
             vram_budget_gb: gb(budget),
+            vram_installed_gb: gb(*installed),
             vram_shared_gb: gb(shared),
             vram_rt_gb: gb(rt_bytes),
             vram_tex_gb: gb(tex_bytes),
@@ -875,6 +920,7 @@ impl Panel {
         let snap = self.snap.as_ref()?;
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
@@ -1010,6 +1056,7 @@ mod tests {
             gpu_name: "AMD RADEON RX 9070 XT".into(),
             vram_used_gb: 11.4,
             vram_budget_gb: 13.2,
+            vram_installed_gb: 16.0,
             vram_shared_gb: 4.2,
             vram_rt_gb: 2.8,
             vram_tex_gb: 3.5,

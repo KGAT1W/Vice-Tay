@@ -215,11 +215,6 @@ fn recheck_soon() -> bool {
 /// look reads 48 KiB, and a frame bakes up to sixteen times).
 const BAKE_AHEAD: [u64; 2] = [12, 2];
 
-/// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
-/// pass before a bake last served all there was, plus one (0: it did not):
-/// until something is new, the next bakes of the frame need no pass.
-static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
-
 /// Free-threaded wrapper around a reusable upload-only [`HostList`] protected
 /// by [`BAKE_UPLOAD`]. D3D12 command allocators, lists, and retained COM
 /// resources are free-threaded when externally synchronized.
@@ -705,23 +700,25 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
+#[cfg(test)]
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
     passes: u64,
-    ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    ranges: SweepRanges<crate::shadow::Shadow>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: SweepRanges::default(), unwatched: Default::default() }
     }
 }
 
+#[cfg(test)]
 impl<T> HeapRanges<T> {
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
         let slot = slot as usize;
@@ -735,7 +732,7 @@ impl<T> HeapRanges<T> {
     }
 
     /// Forgets the slots of one of `parts` parts
-    /// (`HostHeap::buffer_slots_of`).
+    /// (`HostHeap::buffer_stripe_and_changes`).
     fn forget_part(&mut self, part: u32, parts: u32) {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
@@ -745,9 +742,162 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// Cache the union bounds per host copy, not just the range of each slot.
+/// Most slots in a periodic scan still name exactly the same bytes. A copy
+/// can also shrink when its last slot at either endpoint disappears.
+type Counts = std::collections::BTreeMap<u64, usize>;
+struct SweepRanges<T> {
+    slots: Vec<(usize, u64, u64)>,
+    copies: crate::host::ByCopy<(std::sync::Arc<T>, Counts, Counts)>,
+    views: u32,
+}
+
+impl<T> Default for SweepRanges<T> {
+    fn default() -> Self { Self { slots: Vec::new(), copies: Default::default(), views: 0 } }
+}
+
+impl<T> SweepRanges<T> {
+    fn identity(show: Option<&(std::sync::Arc<T>, u64, u64)>) -> (usize, u64, u64) {
+        show.map_or((0, 0, 0), |(s, a, b)| (std::sync::Arc::as_ptr(s) as usize, *a, *b))
+    }
+
+    /// Select against the pre-merge snapshot, even when lookups finish out of order.
+    fn needs_merge(
+        &self,
+        pos: usize,
+        index: u32,
+        changed_tail: Option<(usize, u32)>,
+        shows: Option<&((std::sync::Arc<T>, u64, u64), bool)>,
+    ) -> bool {
+        // Each bitmap visits a slot once. A change after the stripe may visit it
+        // again, reverting a prior result to what the pre-merge snapshot shows.
+        changed_tail.is_some_and(|(start, part)| pos >= start && u64::from(index) % HEAP_ROUND == u64::from(part))
+            || shows.is_some_and(|(_, written)| *written)
+            || Self::identity(shows.map(|(range, _)| range)) != self.slots.get(index as usize).copied().unwrap_or_default()
+    }
+
+    fn set(&mut self, slot: u32, show: Option<(std::sync::Arc<T>, u64, u64)>) {
+        let i = slot as usize;
+        let next = Self::identity(show.as_ref());
+        let old = self.slots.get(i).copied().unwrap_or_default();
+        if old == next { return; }
+        if old.0 != 0 {
+            let (_, lows, highs) = self.copies.get_mut(&old.0).expect("slot owns its range");
+            for (ends, value) in [(&mut *lows, old.1), (&mut *highs, old.2)] {
+                let count = ends.get_mut(&value).expect("slot owns its endpoint");
+                *count -= 1;
+                if *count == 0 { ends.remove(&value); }
+            }
+            if lows.is_empty() { self.copies.remove(&old.0); }
+            self.views -= 1;
+        }
+        if let Some((s, a, b)) = show {
+            let (_, lows, highs) = self.copies.entry(next.0).or_insert_with(|| (s, Counts::new(), Counts::new()));
+            *lows.entry(a).or_default() += 1;
+            *highs.entry(b).or_default() += 1;
+            self.views += 1;
+        }
+        if i >= self.slots.len() { self.slots.resize(i + 1, (0, 0, 0)); }
+        self.slots[i] = next;
+    }
+
+    fn forget_missing(&mut self, part: u32, parts: u32, present: &[u32]) {
+        // The live slots of this stripe are in increasing slot order.
+        let mut slots = present.iter().copied().peekable();
+        for i in (part as usize..self.slots.len()).step_by(parts as usize) {
+            if slots.next_if_eq(&(i as u32)).is_none() && self.slots[i].0 != 0 {
+                self.set(i as u32, None);
+            }
+        }
+    }
+
+    fn spans(&self) -> impl Iterator<Item = (&std::sync::Arc<T>, u64, u64)> {
+        self.copies.values().map(|(s, lows, highs)| (s, *lows.first_key_value().unwrap().0, *highs.last_key_value().unwrap().0))
+    }
+}
+
 #[cfg(test)]
 mod heap_range_tests {
     use super::{HEAP_ROUND, HeapRanges};
+
+    #[test]
+    fn deltas_match_full_ordered_replay_and_uav_publication() {
+        use super::SweepRanges;
+        use std::{collections::BTreeMap, sync::Arc};
+
+        let a = (Arc::new('a'), 4, 12);
+        let b = (Arc::new('b'), 4, 12); // same bounds, different copy
+        let wider = (a.0.clone(), 4, 24);
+        let initial = || {
+            let mut ranges = SweepRanges::default();
+            for slot in [1, 2, 3, 4, 18, 49] {
+                ranges.set(slot, Some(a.clone()));
+            }
+            ranges.set(50, Some(b.clone()));
+            ranges
+        };
+        let events = [
+            // Stripe 2. At slot 34 this pass first finds a copy, then nothing.
+            (2, Some((&b, false))), (18, None), (34, Some((&b, false))), (50, Some((&b, true))),
+            // Changed bitmap, in slot order; repeats interleave with other changes.
+            (1, Some((&a, false))), (2, Some((&a, false))), (3, Some((&wider, false))), (4, None),
+            (17, Some((&b, false))), (18, Some((&a, false))), (34, None),
+            (49, Some((&a, true))), (50, Some((&b, true))), (80, None),
+        ].map(|(slot, show)| (slot, show.map(|(range, written)| (range.clone(), written))));
+        let before = initial();
+        let selected: Vec<_> = events.iter().enumerate().filter_map(|(pos, (index, show))| {
+            before.needs_merge(pos, *index, Some((4, 2)), show.as_ref()).then_some(pos)
+        }).collect();
+        // Includes the unchanged UAVs (also its second publication at 50)
+        // and both kinds of reversion. Unchanged slots 1 and 80 need no merge.
+        assert_eq!(selected, [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert!(!before.needs_merge(0, 2, None, Some(&(a.clone(), false))));
+
+        let replay = |positions: &[usize]| {
+            let mut ranges = initial();
+            let mut uavs = Vec::new();
+            for &pos in positions {
+                let (slot, show) = &events[pos];
+                if let Some((range, true)) = show {
+                    uavs.push((*slot, range.clone()));
+                }
+                ranges.set(*slot, show.as_ref().map(|(r, _)| r.clone()));
+            }
+            let spans: BTreeMap<_, _> = ranges.spans().map(|(s, lo, hi)| (**s, (lo, hi))).collect();
+            (ranges.slots, ranges.views, spans, uavs)
+        };
+        assert_eq!(replay(&selected), replay(&(0..events.len()).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn incremental_extents_match_live_slots_after_moves_and_removals() {
+        use std::{collections::BTreeMap, sync::Arc};
+        let refs: Vec<_> = (0..19usize).map(Arc::new).collect();
+        let mut cache = super::SweepRanges::default();
+        let mut plain = vec![None; 157];
+        let mut seed = 777u32;
+        let mut next = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed as usize };
+        for round in 0..300 {
+            for _ in 0..63 {
+                let i = next() % plain.len();
+                let item = (next() % 7 != 0).then(|| (next() % refs.len(), (next() % 5) as u64, (6 + next() % 7) as u64));
+                plain[i] = item;
+                cache.set(i as u32, item.map(|(s,a,b)| (refs[s].clone(), a, b)));
+            }
+            let stripe = (round % 16) as u32;
+            let mut present = vec![];
+            for i in (stripe as usize..plain.len()).step_by(16) {
+                if next() % 3 == 0 { plain[i] = None; } else { present.push(i as u32); }
+            }
+            cache.forget_missing(stripe, 16, &present);
+            let mut expected = BTreeMap::new();
+            for &(id, a, b) in plain.iter().flatten() {
+                let r = expected.entry(id).or_insert((a,b)); r.0 = r.0.min(a); r.1 = r.1.max(b);
+            }
+            assert_eq!(cache.spans().map(|(s,a,b)| (**s,(a,b))).collect::<BTreeMap<_,_>>(), expected);
+            assert_eq!(cache.views as usize, plain.iter().flatten().count());
+        }
+    }
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -813,6 +963,16 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
+        let mut cached = super::SweepRanges::default();
+        for (&i, s) in &table { cached.set(i, Some(s.clone())); }
+        let mut part = 0;
+        println!("unchanged 1/16 stripe, refresh slots and collect all 4,400 spans: {:.2} ms", best(&mut || {
+            let stripe: Vec<_> = (part..72_000).step_by(16).collect();
+            cached.forget_missing(part, 16, &stripe);
+            for i in stripe { cached.set(i, Some(slots.0[i as usize].as_ref().unwrap().clone())); }
+            part = (part + 1) % 16;
+            cached.spans().map(std::hint::black_box).count()
+        }));
     }
 }
 
@@ -953,7 +1113,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
-fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64, aside: bool) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
@@ -963,20 +1123,23 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
-    let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let mut changed_tail = None;
     let slots = if all {
-        ranges.0.clear();
-        host.buffer_slots()
+        let _ = host.buffer_changes();
+        let slots = host.buffer_slots();
+        ranges.forget_missing(0, 1, &slots);
+        slots
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
+        let (mut slots, changed) = host.buffer_stripe_and_changes::<{ HEAP_ROUND as u32 }>(part);
+        ranges.forget_missing(part, parts, &slots);
+        changed_tail = Some((slots.len(), part));
         slots.extend(changed);
         slots
     } else {
-        changed
+        host.buffer_changes()
     };
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
@@ -1017,8 +1180,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     const AT_A_TIME: usize = 256;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+    // Workers have already paid for the lookup. Hand back only what the
+    // ordered merge can use, rather than allocating and walking one result
+    // per slot on the thread Close is waiting for.
+    static DELTAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let deltas = *DELTAS.get_or_init(|| std::env::var_os("VICTORY_HEAP_VIEW_DELTAS").is_some_and(|v| v == "1"));
+    let trace = |name| aside.then(|| crate::timeline::span(name));
+    let phase = trace("aside heap views: each_view");
     crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+        let looked: Vec<_> = if deltas {
+            parts[n].iter().enumerate().filter_map(|(i, &index)| {
+                let shows = look(index);
+                ranges.needs_merge(n * AT_A_TIME + i, index, changed_tail, shows.as_ref()).then_some((index, shows))
+            }).collect()
+        } else {
+            parts[n].iter().map(|&index| (index, look(index))).collect()
+        };
         // (After each piece while the device lives: a cheap query.)
         if alive
             && let Some(why) = crate::descriptor::host::device_removed()
@@ -1034,6 +1211,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
+    drop(phase);
+    let phase = trace("aside heap views: ordered merge");
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
@@ -1046,19 +1225,14 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
+    drop(phase);
+    let phase = trace("aside heap views: range assembly");
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    let views = ranges.views;
+    let copies = ranges.copies.len();
+    let mut bytes = 0u64;
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1070,26 +1244,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let mut found = Vec::with_capacity(copies);
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for (shadow, from, to) in ranges.spans() {
+        bytes += to - from;
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
             if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
+                && frame >= last && frame - last < every && low <= from && to <= high
             {
                 next_unwatched.insert(id, (last, low, high));
                 continue;
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            next_unwatched.insert(id, (frame, from, to));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        found.push((shadow.clone(), from, to.min(from + shadow.left(from))));
     }
     *unwatched = next_unwatched;
     drop(kept);
+    drop(phase);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
+    let phase = trace("aside heap views: look_at_holes");
     crate::watch::look_at_holes();
+    drop(phase);
     #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
@@ -1102,7 +1280,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -2176,13 +2354,13 @@ impl State {
                 crate::descriptor::with_heap(at, |heap| {
                     // The list retains the original stride buffer. A newly
                     // allocated heap at the same CPU address has another one.
-                    heap.host().filter(|h| h.strides_gpu() == Some(gpu)).map(|h| heap_buffer_pass(heap, h, frame))
+                    heap.host().filter(|h| h.strides_gpu() == Some(gpu)).map(|h| heap_buffer_pass(heap, h, frame, true))
                 })
                     .flatten()
                     .unwrap_or_default()
             });
         } else {
-            for (shadow, from, to) in heap_buffer_pass(heap, host, frame) {
+            for (shadow, from, to) in heap_buffer_pass(heap, host, frame, false) {
                 shadow.refresh(list, from, to - from);
             }
         }
@@ -2413,14 +2591,8 @@ impl State {
                 crate::texture::BAKING.set(exact);
                 self.flush_for_bake(bake_list, host, Some(&mut sync));
                 let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-                let run_pass = left > 0
-                    && (first
-                        || !exact
-                        || {
-                            let (writes, noted) = host.texture_news();
-                            noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
-                        });
-                let mut served = false;
+                let run_pass = left > 0 && (first || !exact || !host.bake_covered());
+                let mut covered = None;
                 if run_pass {
                     let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
@@ -2434,9 +2606,8 @@ impl State {
                             "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (VICTORY_BAKE_TEXTURES_MS=0: not)"
                         );
                     }
-                    BAKE_SERVED.store(0, Ordering::Relaxed);
                     PASS_BUDGET.set(Some((left, 2 << 30, true)));
-                    served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                    covered = self.heap_textures(bake_list, heap, host, Some(&mut sync));
                     PASS_BUDGET.set(None);
                 }
                 crate::texture::BAKING.set(false);
@@ -2453,8 +2624,8 @@ impl State {
                 host.texture_views_remade();
                 host.texture_slots_flip();
                 drop(sync.keep);
-                if run_pass && served && exact {
-                    BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+                if let Some(revision) = covered {
+                    host.finish_bake(revision);
                 }
                 BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
                 return;
@@ -2467,16 +2638,15 @@ impl State {
             if left == 0 {
                 return;
             }
-            if !first && exact {
-                let (writes, noted) = host.texture_news();
-                if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
-                    return;
-                }
+            if !first && exact && host.bake_covered() {
+                return;
             }
             EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed);
             PASS_BUDGET.set(Some((left, 2 << 30, true)));
             crate::texture::BAKING.set(exact);
-            let _ = self.heap_textures(list, heap, host, None);
+            if let Some(revision) = self.heap_textures(list, heap, host, None) {
+                host.finish_bake(revision);
+            }
             crate::texture::BAKING.set(false);
             PASS_BUDGET.set(None);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2581,6 +2751,8 @@ impl State {
     /// a second): uploaded again when more of it is mapped. Pages mapped
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
+    /// A complete exact bake returns the heap revision observed before it
+    /// gathered the slots. Its caller confirms coverage after publishing.
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     fn heap_textures(
         &self,
@@ -2588,10 +2760,10 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
         mut sync: Option<&mut BakeSync>,
-    ) -> bool {
+    ) -> Option<u64> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return true;
+            return None;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
@@ -2635,6 +2807,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let pass = host.begin_texture_pass();
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2663,11 +2836,14 @@ impl State {
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
+        // A capped snapshot can leave due slots outside the pass.
+        let mut served = on_time as u64 == census[1];
         if baking {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            let (ahead, ahead_census) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            served &= ahead.len() as u64 == ahead_census[1];
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2743,10 +2919,6 @@ impl State {
         };
 
         let began = std::time::Instant::now();
-        if sync.is_none() {
-            BAKE_SERVED.store(0, Ordering::Relaxed);
-        }
-        let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -3081,7 +3253,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return false;
+                return None;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -3132,10 +3304,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        if sync.is_none() && baking && served {
-            BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
-        }
-        served
+        pass.revision.filter(|_| baking && served)
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

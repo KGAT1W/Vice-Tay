@@ -428,10 +428,7 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let marked = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -441,9 +438,13 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
+            parts = port_scan_parts(
+                &marked,
+                crate::port_descriptors::to_check(frame),
+                start as usize,
+                end as usize,
+                step as usize,
+            );
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
@@ -826,6 +827,51 @@ fn changed_slots(
     first.min(last)..last
 }
 
+/// Marks own their slots, even if a wider fallback read would fail. The
+/// fallback takes only the complete slots between the sorted marked runs.
+/// The write watch supplies each fallback page at most once.
+#[cfg(windows)]
+fn port_scan_parts(
+    marked: &[(u32, u32)],
+    pages: Vec<usize>,
+    heap_start: usize,
+    heap_end: usize,
+    step: usize,
+) -> Vec<(usize, usize, bool)> {
+    let mut parts: Vec<_> = marked
+        .iter()
+        .map(|&(first, count)| {
+            let from = heap_start + first as usize * step;
+            (from, from + count as usize * step, false)
+        })
+        .collect();
+    let marked_parts = parts.len();
+    for page in pages {
+        let from = page.max(heap_start);
+        let to = (page + crate::watch::PAGE).min(heap_end);
+        if from >= to {
+            continue;
+        }
+        let mut from = heap_start + (from - heap_start).div_ceil(step) * step;
+        let to = heap_start + (to - heap_start) / step * step;
+        let first_mark = parts[..marked_parts].partition_point(|&(_, end, _)| end <= from);
+        for n in first_mark..marked_parts {
+            let (mark_from, mark_to, _) = parts[n];
+            if from >= to || mark_from >= to {
+                break;
+            }
+            if from < mark_from {
+                parts.push((from, mark_from, true));
+            }
+            from = mark_to;
+        }
+        if from < to {
+            parts.push((from, to, true));
+        }
+    }
+    parts
+}
+
 /// The title's view heap that shaders of a list without one get their views
 /// from (`draw.rs`, `bind`): the title's structure builder binds root views
 /// only, and the host shows those, and memory by address, through heap slots.
@@ -902,6 +948,60 @@ pub(crate) fn constant_slot(
     {
         host.constant_at(index, buffer, gpu, size);
     }
+}
+
+/// A pending rebind, with no borrowed heap or resource pointer.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConstantSlot {
+    pub(crate) heap: usize,
+    pub(crate) index: u32,
+    pub(crate) gpu: u64,
+    pub(crate) size: u32,
+}
+
+#[cfg(windows)]
+const CBV_LOCK_BATCH: usize = 64;
+
+/// Only adjacent writes share a lookup; applying a run never eliminates a write.
+#[cfg(windows)]
+fn bind_constant_runs<H>(
+    slots: &[ConstantSlot],
+    mut resolve: impl FnMut(usize) -> Option<H>,
+    mut bind: impl FnMut(&H, &ConstantSlot),
+) -> usize {
+    let mut bound = 0;
+    for run in slots.chunk_by(|a, b| a.heap == b.heap) {
+        if let Some(host) = resolve(run[0].heap) {
+            for slot in run {
+                bind(&host, slot);
+            }
+            bound += run.len();
+        }
+    }
+    bound
+}
+
+/// Returns (registry locks taken, live-host slot writes). Each guard pins
+/// its resolved hosts through `constant_at`, including resource retirement.
+#[cfg(windows)]
+pub(crate) fn constant_slots(
+    slots: &[ConstantSlot],
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> (usize, usize) {
+    let (mut locks, mut bound) = (0, 0);
+    for batch in slots.chunks(CBV_LOCK_BATCH) {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        locks += 1;
+        bound += bind_constant_runs(batch, |key| {
+            let &(_, _, at) = heaps.iter().find(|&&(_, _, at)| at == key)?;
+            // SAFETY: Heap::drop must take the write lock before freeing it.
+            let heap = unsafe { &*(at as *const Heap) };
+            heap.host.get()?.as_ref()
+        }, |host, slot| host.constant_at(slot.index, buffer, slot.gpu, slot.size));
+        // Release between batches so heap creation and destruction can proceed.
+    }
+    (locks, bound)
 }
 
 #[cfg(windows)]
@@ -1982,6 +2082,43 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn cbv_batch_interleaved_heaps_and_duplicate_slots_match_per_op() {
+        let slots: Vec<_> = (0..CBV_LOCK_BATCH * 3 + 1).map(|n| ConstantSlot {
+            heap: [2, 2, 5, 2, 7, 5][n % 6],
+            index: 4,
+            gpu: 0x10000 + n as u64 * 256,
+            size: n as u32 + 1,
+        }).collect();
+        // Distinct host identities, including a missing heap and a heap
+        // replaced between batches. Compare every write, not only the last.
+        let resolve = |heap, batch| match (heap, batch) {
+            (2, 1) | (7, _) => None,
+            (2, 0) => Some(10),
+            (2, _) => Some(11),
+            (5, _) => Some(12),
+            _ => unreachable!(),
+        };
+        let expected: Vec<_> = slots.iter().enumerate().filter_map(|(i, slot)| {
+            Some((resolve(slot.heap, i / CBV_LOCK_BATCH)?, slot.index, slot.gpu, slot.size))
+        }).collect();
+        let mut writes = Vec::new();
+        let mut lookups = 0;
+        let mut bound = 0;
+        for (i, batch) in slots.chunks(CBV_LOCK_BATCH).enumerate() {
+            bound += bind_constant_runs(batch, |heap| {
+                lookups += 1;
+                resolve(heap, i)
+            }, |&host, slot| writes.push((host, slot.index, slot.gpu, slot.size)));
+        }
+        assert_eq!(writes, expected);
+        assert_eq!(bound, expected.len());
+        assert_eq!(lookups, slots.chunks(CBV_LOCK_BATCH)
+            .map(|b| 1 + b.windows(2).filter(|pair| pair[0].heap != pair[1].heap).count())
+            .sum::<usize>());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn raw_heap_sync_stops_before_dynamic_host_slots() {
         let start = 0x1000usize;
         let step = 32;
@@ -2005,6 +2142,48 @@ mod tests {
                 capped
             ),
             5..5
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marked_and_fallback_scans_own_disjoint_slots() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page;
+        let per_page = (page / step) as u32;
+        let marked = [(per_page - 1, 2), (per_page + 4, 2), (3 * per_page - 1, 2)];
+        let parts = port_scan_parts(
+            &marked,
+            vec![start + 3 * page, start + page],
+            start,
+            start + 4 * page,
+            step,
+        );
+        assert_eq!(
+            parts,
+            [
+                (start + page - step, start + page + step, false),
+                (start + page + 4 * step, start + page + 6 * step, false),
+                (start + 3 * page - step, start + 3 * page + step, false),
+                (start + 3 * page + step, start + 4 * page, true),
+                (start + page + step, start + page + 4 * step, true),
+                (start + page + 6 * step, start + 2 * page, true),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_mark_owns_its_slot_when_the_slot_straddles_a_fallback_page() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page - step / 2;
+        let marked = [(0, 2)];
+        let parts = port_scan_parts(&marked, vec![page], start, start + 2 * page, step);
+        assert_eq!(
+            parts,
+            [(start, start + 2 * step, false), (start + 2 * step, start + page, true)]
         );
     }
 

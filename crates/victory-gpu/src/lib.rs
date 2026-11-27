@@ -23,7 +23,7 @@ mod lightprobe;
 mod texlate;
 #[cfg(windows)]
 mod texstore;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, any(feature = "diagnostics", feature = "frame-samples")))]
 mod capture;
 #[cfg(windows)]
 mod compose;

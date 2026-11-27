@@ -1,7 +1,8 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. Back-buffer snapshots also work with `frame-samples`; per-draw
+//! tracing, render target dumps and black-frame probes require diagnostics.
 
 use std::path::PathBuf;
 
@@ -47,7 +48,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || world_on() && first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -120,21 +121,33 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+// Timing runs need just enough pictures to identify the opening shot.
+// Avoid the per-draw trace and the synchronous readback every eight frames.
+fn sparse_world() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD_SPARSE").is_some_and(|v| v == "1"))
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn world_age() -> Option<u64> {
+    crate::queue::presented().checked_sub(WORLD.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
-    if world_on()
+    if (world_on() || sparse_world())
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
-        tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+        tracing::info!(frame, "the first frame of 500 draws or more");
         #[cfg(feature = "diagnostics")]
-        if let Some(folder) = folder() {
+        if world_on() && let Some(folder) = folder() {
             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
             let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
 "));
@@ -144,6 +157,24 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if sparse_world() && !world_on() {
+        let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+        static TIMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TIMED.get_or_init(|| crate::switch::on("VICTORY_TIMED_ARREST")) {
+            if first == u64::MAX || n < first || folder().is_none() { return false; }
+            static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static PASSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let age = CLOCK.get_or_init(std::time::Instant::now).elapsed().as_millis();
+            let due = [7800, 8200, 9400, 11600, 12000, 13500].partition_point(|&at| at <= age);
+            return PASSED.fetch_max(due, std::sync::atomic::Ordering::Relaxed) < due || n == first;
+        }
+        static SHOT_MATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SHOT_MATCH.get_or_init(|| crate::switch::on("VICTORY_MATCH_SHOT")) {
+            let after = n.wrapping_sub(first);
+            return folder().is_some() && first != u64::MAX && after <= 240 && after.is_multiple_of(16);
+        }
+        return folder().is_some() && first != u64::MAX && matches!(n.wrapping_sub(first), 16 | 72 | 132 | 200 | 332);
+    }
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -187,6 +218,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
 }
 
 /// A PNG of `width * height` pixels of 8-bit RGB.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     let row = width as usize * 3;
     let mut raw = Vec::with_capacity((row + 1) * height as usize);
@@ -353,15 +385,18 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
+#[cfg(feature = "diagnostics")]
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(feature = "diagnostics")]
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
@@ -375,6 +410,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
 }
 
 /// At the present of frame `frame`: saves the noted targets.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -392,6 +428,7 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -478,6 +515,7 @@ fn dump_one(
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
 /// (the most common first), how many texels have each of its bits, and the
 /// box of the texels with bit 3 (0x08).
+#[cfg(feature = "diagnostics")]
 fn stencil_values(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -536,6 +574,7 @@ fn stencil_values(
     }
 }
 
+#[cfg(any(feature = "diagnostics", test))]
 fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
@@ -548,6 +587,7 @@ fn half(h: u16) -> f32 {
 
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
 /// (the 11- and 10-bit floats of R11G11B10).
+#[cfg(any(feature = "diagnostics", test))]
 fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
@@ -561,6 +601,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// colors and packed 16-bit BGR use their full channel range. Other formats
 /// scale to the highest finite value, with single channels shown in grey
 /// from their lowest to highest value. Returns `None` for unhandled formats.
+#[cfg(any(feature = "diagnostics", test))]
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
@@ -740,13 +781,16 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 }
 
 /// Pixels per side of the grid [`probe`] reads.
+#[cfg(feature = "diagnostics")]
 const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
 /// alignment).
+#[cfg(feature = "diagnostics")]
 const SLOT: u64 = 512;
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
@@ -831,6 +875,7 @@ pub(crate) fn probe(
 }
 
 /// Whether every pixel [`probe`] read is (near) black.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
@@ -857,9 +902,11 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
 
 /// The brightest probed channel of the last frames, oldest first: a fade
 /// darkens over several, a glitch drops at once.
+#[cfg(feature = "diagnostics")]
 static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()

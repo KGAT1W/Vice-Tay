@@ -203,6 +203,10 @@ struct Pool {
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
+    short_tail: bool,
+    /// Hint to the caller outside the lock. `state.running` under the lock
+    /// remains the completion predicate, including after a panic.
+    tail_done: std::sync::atomic::AtomicBool,
 }
 
 struct State {
@@ -228,12 +232,20 @@ impl Pool {
     }
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
+        let short_tail = matches!(name, "victory-land" | "victory-records" | "victory-views")
+            && std::env::var_os("VICTORY_RX_POOL").is_some_and(|v| v == "1");
+        Self::with_tail(name, threads, short_tail)
+    }
+
+    fn with_tail(name: &'static str, threads: usize, short_tail: bool) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
             threads,
+            short_tail,
+            tail_done: std::sync::atomic::AtomicBool::new(false),
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
@@ -266,7 +278,12 @@ impl Pool {
             state.running -= 1;
             state.panicked |= ran.is_err();
             if state.running == 0 {
-                self.idle.notify_all();
+                if !self.short_tail {
+                    self.idle.notify_all();
+                } else if state.work.is_none() {
+                    self.tail_done.store(true, Ordering::Relaxed);
+                    self.idle.notify_one(); // only the owner of `turn` can be waiting
+                }
             }
         }
     }
@@ -300,6 +317,19 @@ impl Pool {
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
+        if self.short_tail && state.running != 0 && ran.is_ok() {
+            // In the iufnkfl0 / o9buqgjv captures the last land, records or
+            // views job often ended within 40 us of parking, sometimes with
+            // another millisecond before the caller woke. Let that caller
+            // catch short tails; long jobs still sleep, idle helpers never spin.
+            self.tail_done.store(false, Ordering::Relaxed);
+            drop(state);
+            let start = std::time::Instant::now();
+            while !self.tail_done.load(Ordering::Relaxed) && start.elapsed() < std::time::Duration::from_micros(40) {
+                std::hint::spin_loop();
+            }
+            state = self.state();
+        }
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }

@@ -7,6 +7,14 @@ VIctory is. The trees this one is built from are listed in the
 [README](../README.md#credits), with the people whose work came over by hand
 (their commits name them).
 
+The RX 7600 test build also carries these Vice-Tay changes:
+[bounded copy-worker wakeups](https://github.com/TaynanGT/Vice-Tay/commit/d60fc84)
+by readmet3xt-lab, [texture change queue compaction](https://github.com/TaynanGT/Vice-Tay/commit/53a1f16)
+by edsuuu with [range coverage tests](https://github.com/TaynanGT/Vice-Tay/pull/165),
+[GPU alias refresh after a title upload](https://github.com/TaynanGT/Vice-Tay/commit/7993c1b)
+by fxceless from VI-BR-PORT, and the texture tiling portion of
+[Taynan Piza's readback changes](https://github.com/TaynanGT/Vice-Tay/pull/166).
+
 Everyone with a commit in this history, by number of commits (merge commits
 left out; `git shortlog -sn --no-merges` gives it for any revision):
 

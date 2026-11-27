@@ -321,13 +321,23 @@ struct Files {
     io: Io,
 }
 
+// Size the worker pool and its per-file handle array from the same setting.
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("VICTORY_DSTORAGE_WORKERS").ok()
+            .and_then(|s| s.trim().parse::<usize>().ok()).filter(|&n| n > 0)
+            .map_or(logical, |n| n.min(logical))
+    })
+}
+
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
-            Io::Handles | Io::Direct => workers,
+            Io::Handles | Io::Direct => worker_count(),
         };
         Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io }
     }
@@ -629,7 +639,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()

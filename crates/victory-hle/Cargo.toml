@@ -54,6 +54,8 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
+panel = ["victory-gpu/panel"]
+frame-samples = ["victory-gpu/frame-samples"]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
 
